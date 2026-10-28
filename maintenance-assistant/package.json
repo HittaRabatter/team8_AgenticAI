@@ -1,0 +1,11 @@
+{
+  "name": "maintenance-assistant",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@azure/cosmos": "^4.2.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
