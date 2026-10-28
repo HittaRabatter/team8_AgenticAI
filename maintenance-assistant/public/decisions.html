@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Decisions - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head">
+    <div><h1>AI decisions and what-if analysis</h1>
+      <p class="muted">See every step behind a maintenance decision, the forecast it relied on, and how the outcome changes when assumptions change. Nothing is saved until you create the work order.</p></div>
+  </div>
+  <div id="err" class="err"></div>
+
+  <section class="card" style="margin-bottom:18px">
+    <div class="form-grid">
+      <div class="field"><label for="machine">Machine</label><select id="machine"></select></div>
+      <div class="field"><label for="crew">Crew size</label>
+        <select id="crew"><option value="">Decide automatically</option><option value="1">1 technician</option><option value="2">2 technicians</option><option value="3">3 technicians</option></select></div>
+      <div class="field"><label for="assume">What if the last change repeats every (minutes)</label>
+        <input id="assume" type="number" min="1" placeholder="Blank = use the real reading times"></div>
+      <div class="field"><label>AI model</label>
+        <label class="status-line" style="font-weight:400;color:inherit"><input type="checkbox" id="useLlm"> <span id="llmText"></span></label></div>
+    </div>
+    <div class="actions" style="margin-top:14px">
+      <button id="run" class="primary">Run decision</button>
+      <button id="sweep">Compare different assumptions</button>
+      <button id="create" disabled>Create this work order</button>
+    </div>
+  </section>
+
+  <div id="result" class="hidden">
+    <div class="kpis" id="summary"></div>
+    <div id="notes"></div>
+    <section class="card" style="margin-bottom:18px"><div class="card-head"><h2>Forecast</h2><span class="muted" id="fcNote"></span></div><div class="charts" id="charts"></div></section>
+    <section class="card" style="margin-bottom:18px" id="sweepCard"><div class="card-head"><h2>How the decision changes with the assumption</h2></div><div id="sweepOut"></div></section>
+    <section class="card"><div class="card-head"><h2>Decision trace</h2><span class="muted">Every step, in order</span></div><div id="trace"></div></section>
+  </div>
+</main>
+
+<script src="common.js"></script>
+<script src="trace.js"></script>
+<script>
+let last = null, settings = null;
+
+function options(extra = {}) {
+  return { dryRun: true, useLlm: $("useLlm").checked, crewSize: Number($("crew").value) || null,
+    assumeIntervalMin: Number($("assume").value) || null, ...extra };
+}
+const run = (body) => api(`/api/orchestrate/${encodeURIComponent($("machine").value)}`, { method: "POST", body });
+
+async function showResult(r) {
+  last = r;
+  $("result").classList.remove("hidden");
+  const wo = r.workOrder;
+  const fc = r.forecast || {};
+  $("summary").innerHTML = wo ? [
+    [wo.priority === "critical" ? "red" : "amber", wo.priority, "Priority"],
+    ["", wo.scheduledDate ? fmtDate(wo.scheduledDate) + " UTC" : "Unscheduled", "Booked slot"],
+    ["", wo.crew.map((c) => c.name).join(", ") || "-", `Crew of ${wo.crewSize}`],
+    ["green", `${r.decisions.diagnosis} / ${r.decisions.dispatch}`, "Diagnosis / dispatch decided by"],
+    ["amber", fc.earliestCriticalMinutes == null ? "Not reached" : `${fc.earliestCriticalMinutes} min`, `Projected time to critical (${fc.confidence || "n/a"} confidence)`],
+  ].map(([c, v, k]) => `<div class="kpi ${c}"><b style="font-size:18px">${esc(v)}</b><span>${esc(k)}</span></div>`).join("")
+    : `<div class="kpi"><b style="font-size:18px">No work order</b><span>${esc(r.reason || r.action)}</span></div>`;
+  $("notes").innerHTML = (r.warnings?.length ? `<div class="warn" style="margin-bottom:18px">${r.warnings.map(esc).join("<br>")}</div>` : "");
+  $("create").disabled = !(r.action === "dry_run" && !r.duplicateOf);
+
+  const detail = r.forecastDetail || await api(`/api/forecast/${encodeURIComponent($("machine").value)}${$("assume").value ? `?assumeIntervalMin=${encodeURIComponent($("assume").value)}` : ""}`);
+  $("fcNote").textContent = `${detail.readingsUsed} readings${detail.assumeIntervalMin ? `, assuming the last change repeats every ${detail.assumeIntervalMin} min` : ""}. Dashed line is the projection.`;
+  $("charts").innerHTML = detail.metrics.filter((m) => m.history.length).slice(0, 6).map((m) => `
+    <div><b>${esc(prettyMetric(m.metric))}</b> <span class="muted">${esc(m.unit || "")} · ${esc(m.slopePerHour)} per hour · ${esc(m.confidence)} confidence</span>${forecastChart(m)}</div>`).join("")
+    || `<span class="muted">No forecastable readings.</span>`;
+  $("trace").innerHTML = r.trace ? traceHtml(r.trace) : `<span class="muted">${esc(r.reason || "No decision was needed.")}</span>`;
+}
+
+$("run").onclick = async () => {
+  $("err").textContent = "";
+  $("run").disabled = true;
+  try { await showResult(await run(options())); $("sweepCard").classList.add("hidden"); }
+  catch (e) { $("err").textContent = e.message; }
+  $("run").disabled = false;
+};
+
+// Re-runs the decision for several assumptions to show when the outcome flips.
+$("sweep").onclick = async () => {
+  $("err").textContent = "";
+  $("sweep").disabled = true;
+  try {
+    const rows = [];
+    for (const minutes of [null, 15, 30, 60, 120, 240]) {
+      const r = await run(options({ assumeIntervalMin: minutes, useLlm: false }));
+      const wo = r.workOrder;
+      rows.push([minutes ? `Every ${minutes} min` : "Real reading times", r.forecast?.confidence || "-",
+        r.forecast?.earliestCriticalMinutes == null ? "not reached" : `${r.forecast.earliestCriticalMinutes} min`,
+        wo ? raw(badge(wo.priority)) : "-", wo?.scheduledDate ? fmtDate(wo.scheduledDate) + " UTC" : "-",
+        wo ? `${wo.crewSize}: ${wo.crew.map((c) => c.name).join(", ")}` : "-", r.reason || (wo ? "" : r.action)]);
+    }
+    $("sweepOut").innerHTML = `<div class="muted" style="margin-bottom:8px">Rules only, so results are repeatable. A trend is acted on only when it has medium or high confidence or is an explicit what-if.</div>` +
+      miniTable(["Assumption", "Confidence", "Time to critical", "Priority", "Booked slot", "Crew", "Note"], rows);
+    $("sweepCard").classList.remove("hidden");
+    $("result").classList.remove("hidden");
+  } catch (e) { $("err").textContent = e.message; }
+  $("sweep").disabled = false;
+};
+
+$("create").onclick = async () => {
+  $("create").disabled = true;
+  try {
+    const r = await run(options({ dryRun: false }));
+    $("err").textContent = "";
+    alert(`Created ${r.workOrder?.workOrderNumber || "work order"}.`);
+  } catch (e) { $("err").textContent = e.message; }
+};
+
+(async () => {
+  renderNav("decisions.html");
+  try {
+    const [ms, s] = await Promise.all([api("/api/machines"), api("/api/settings")]);
+    settings = s;
+    $("machine").innerHTML = ms.map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("");
+    $("useLlm").checked = s.llmConfigured;
+    $("useLlm").disabled = !s.llmConfigured;
+    $("llmText").innerHTML = s.llmConfigured ? "Use the AI model for diagnosis and dispatch" : `Not configured, decisions use rules. <a href="settings.html">Set it up</a>`;
+  } catch (e) { $("err").textContent = e.message; }
+})();
+</script>
+</body>
+</html>

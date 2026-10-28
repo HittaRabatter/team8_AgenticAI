@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head"><div><h1>Settings</h1>
+    <p class="muted">Connect a database and an AI model. Changes apply immediately; secrets are stored on this computer in <code>data/settings.json</code> and are never shown again.</p></div></div>
+  <div id="err" class="err"></div>
+
+  <section class="card" style="margin-bottom:18px">
+    <div class="card-head"><h2>Database (Azure Cosmos DB for NoSQL)</h2>
+      <span class="status-line"><span class="dot" id="dbDot"></span><span id="dbStatus" class="muted"></span></span></div>
+    <div class="form-grid">
+      <div class="field" style="grid-column:1/-1"><label for="cs">Connection string (paste this, or fill in endpoint and key below)</label>
+        <input id="cs" type="password" autocomplete="off" placeholder="AccountEndpoint=https://...;AccountKey=...;"></div>
+      <div class="field"><label for="endpoint">Endpoint</label><input id="endpoint" placeholder="https://your-account.documents.azure.com:443/"></div>
+      <div class="field"><label for="key">Account key</label><input id="key" type="password" autocomplete="off" placeholder="Leave blank to keep the saved key"></div>
+      <div class="field"><label for="database">Database</label>
+        <select id="databaseSel" class="hidden"></select><input id="database" placeholder="Database name"></div>
+    </div>
+    <div class="actions" style="margin-top:14px"><button id="testDb">Test connection and load containers</button></div>
+    <div id="testOut" class="muted" style="margin-top:10px"></div>
+
+    <h3 style="margin:20px 0 6px">Container mapping</h3>
+    <p class="muted" style="margin:0 0 10px">The app reads these ten kinds of data. If your containers have different names, choose which container holds each one.</p>
+    <div class="table-wrap"><table class="mini"><thead><tr><th>Data the app needs</th><th>Container in your database</th></tr></thead><tbody id="mapRows"></tbody></table></div>
+    <div class="actions" style="margin-top:14px"><button id="saveDb" class="primary">Save database settings</button></div>
+    <p class="muted" style="margin-top:10px">Only Cosmos DB for NoSQL is supported. Other engines (SQL, MongoDB, ...) would need their own connector. Work order status changes assume the WorkOrders container is partitioned by <code>/status</code>.</p>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>AI model (Azure OpenAI)</h2>
+      <span class="status-line"><span class="dot" id="llmDot"></span><span id="llmStatus" class="muted"></span></span></div>
+    <div class="form-grid">
+      <div class="field"><label for="lEndpoint">Endpoint</label><input id="lEndpoint" placeholder="https://your-resource.openai.azure.com"></div>
+      <div class="field"><label for="lDeployment">Deployment name</label><input id="lDeployment" placeholder="e.g. gpt-4o"></div>
+      <div class="field"><label for="lKey">API key</label><input id="lKey" type="password" autocomplete="off" placeholder="Leave blank to keep the saved key"></div>
+      <div class="field"><label for="lVersion">API version</label><input id="lVersion"></div>
+    </div>
+    <div class="actions" style="margin-top:14px"><button id="saveLlm" class="primary">Save AI settings</button><button id="testLlm">Test saved AI settings</button></div>
+    <div id="llmOut" class="muted" style="margin-top:10px"></div>
+    <p class="muted" style="margin-top:10px">Without an AI model the system uses rule-based decisions. With one, the model proposes diagnosis and dispatch, and the code validates every choice.</p>
+  </section>
+  <section class="card" style="margin-top:18px">
+    <div class="card-head"><h2>Agent definitions</h2><span class="muted">Loaded from the <code>agents</code> folder (copied from <code>.github/agents</code> in agentic-factory-hack)</span></div>
+    <div id="agentList"></div>
+  </section>
+
+  <section class="card" style="margin-top:18px">
+    <div class="card-head"><h2>Demo data</h2></div>
+    <p class="muted" style="margin-top:0">Deletes all current work orders, brings back the original sample work orders and removes simulated readings. The other containers are not touched.</p>
+    <div class="actions"><button id="restoreData">Restore initial data</button><span id="restoreOut" class="muted"></span></div>
+  </section>
+</main>
+
+<script src="common.js"></script>
+<script>
+const DESCRIPTIONS = {
+  Machines: "Equipment list", Telemetry: "Sensor readings over time", Thresholds: "Warning and critical limits per machine type",
+  MaintenanceHistory: "Past failures and repairs", WorkOrders: "Work orders", Technicians: "Technicians, skills and shifts",
+  PartsInventory: "Spare parts and stock", Suppliers: "Suppliers and lead times", KnowledgeBase: "Troubleshooting articles",
+  MaintenanceWindows: "Planned production windows",
+};
+let settings = null, containers = null;
+
+function renderStatus() {
+  $("dbDot").className = "dot " + (settings.connected ? "ok" : "bad");
+  $("dbStatus").textContent = settings.connected ? `Connected to ${settings.cosmos.database}` : "Not connected";
+  $("llmDot").className = "dot " + (settings.llmConfigured ? "ok" : "");
+  $("llmStatus").textContent = settings.llmConfigured ? "Configured" : "Not configured (rules are used)";
+}
+
+function renderMapping(suggested) {
+  $("mapRows").innerHTML = settings.logical.map((l) => {
+    const current = settings.containers[l];
+    const value = suggested?.[l] || current;
+    const control = containers
+      ? `<select data-map="${l}"><option value="">(not mapped)</option>${containers.map((c) => `<option ${c === value ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
+         ${containers.includes(value) ? "" : '<span class="muted"> no container with this name</span>'}`
+      : `<input data-map="${l}" value="${esc(value)}">`;
+    return `<tr><td><b>${esc(l)}</b><div class="muted">${esc(DESCRIPTIONS[l] || "")}</div></td><td>${control}</td></tr>`;
+  }).join("");
+}
+
+function creds() {
+  return { connectionString: $("cs").value.trim() || undefined, endpoint: $("endpoint").value.trim() || undefined,
+    key: $("key").value || undefined, database: ($("databaseSel").classList.contains("hidden") ? $("database").value : $("databaseSel").value).trim() || undefined };
+}
+
+async function load() {
+  settings = await api("/api/settings");
+  $("endpoint").value = settings.cosmos.endpoint;
+  $("database").value = settings.cosmos.database;
+  $("key").placeholder = settings.cosmos.hasKey ? "Saved. Leave blank to keep it" : "Account key";
+  $("lEndpoint").value = settings.llm.endpoint;
+  $("lDeployment").value = settings.llm.deployment;
+  $("lVersion").value = settings.llm.apiVersion;
+  $("lKey").placeholder = settings.llm.hasKey ? "Saved. Leave blank to keep it" : "API key";
+  renderStatus();
+  renderMapping();
+}
+
+$("testDb").onclick = async () => {
+  $("err").textContent = "";
+  $("testOut").textContent = "Testing...";
+  try {
+    const r = await api("/api/settings/test", { method: "POST", body: creds() });
+    if (!r.ok) { $("testOut").textContent = ""; $("err").textContent = r.error; return; }
+    $("databaseSel").innerHTML = r.databases.map((d) => `<option ${d === r.database ? "selected" : ""}>${esc(d)}</option>`).join("");
+    $("databaseSel").classList.remove("hidden");
+    $("database").classList.add("hidden");
+    $("databaseSel").onchange = async () => { $("testDb").click(); };
+    containers = r.containers;
+    const unmapped = settings.logical.filter((l) => !r.suggested[l] && !containers.includes(settings.containers[l]));
+    $("testOut").textContent = `Connected. ${r.databases.length} database(s); ${containers.length} container(s) in ${r.database || "the selected database"}.` +
+      (r.database ? (unmapped.length ? ` Not found by name: ${unmapped.join(", ")}. Choose them below.` : " All data types were matched by name.") : " Choose a database to see its containers.");
+    renderMapping(r.suggested);
+  } catch (e) { $("testOut").textContent = ""; $("err").textContent = e.message; }
+};
+
+$("saveDb").onclick = async () => {
+  $("err").textContent = "";
+  const containersMap = {};
+  document.querySelectorAll("[data-map]").forEach((el) => { if (el.value) containersMap[el.dataset.map] = el.value; });
+  try {
+    settings = await api("/api/settings", { method: "PUT", body: { cosmos: creds(), containers: containersMap } });
+    $("cs").value = ""; $("key").value = "";
+    $("testOut").textContent = "Saved. The app now uses this database.";
+    await load();
+  } catch (e) { $("err").textContent = e.message; }
+};
+
+$("saveLlm").onclick = async () => {
+  $("err").textContent = "";
+  try {
+    settings = await api("/api/settings", { method: "PUT", body: { llm: { endpoint: $("lEndpoint").value.trim(), deployment: $("lDeployment").value.trim(),
+      apiKey: $("lKey").value || undefined, apiVersion: $("lVersion").value.trim() || undefined } } });
+    $("lKey").value = "";
+    $("llmOut").textContent = "Saved.";
+    await load();
+  } catch (e) { $("err").textContent = e.message; }
+};
+
+$("testLlm").onclick = async () => {
+  $("llmOut").textContent = "Testing...";
+  try {
+    const r = await api("/api/settings/llm/test", { method: "POST", body: {} });
+    $("llmOut").textContent = r.ok ? "The AI model responded." : `Failed: ${r.error}`;
+  } catch (e) { $("llmOut").textContent = ""; $("err").textContent = e.message; }
+};
+
+renderNav("settings.html");
+api("/api/agents").then((list) => {
+  $("agentList").innerHTML = `<div class="table-wrap"><table class="mini"><thead><tr><th>File</th><th>Size</th><th>Purpose</th><th>How this tool uses it</th></tr></thead><tbody>${
+    list.map((a) => `<tr><td><b>${esc(a.file)}</b></td><td>${esc(a.bytes)} bytes</td><td>${esc(a.description)}</td><td>${esc(a.usage)}</td></tr>`).join("")}</tbody></table></div>`;
+}).catch(() => {});
+$("restoreData").onclick = async () => {
+  if (!confirm("Restore the initial data?\n\nThis deletes ALL current work orders and removes simulated readings.")) return;
+  try {
+    const r = await api("/api/restore-initial", { method: "POST", body: { confirm: "RESTORE" } });
+    $("restoreOut").textContent = `Done: removed ${r.workOrdersRemoved} work order(s), restored ${r.workOrdersRestored}, removed ${r.simulatedReadingsRemoved} simulated reading(s).`;
+  } catch (e) { $("err").textContent = e.message; }
+};
+load().catch((e) => ($("err").textContent = e.message));
+</script>
+</body>
+</html>

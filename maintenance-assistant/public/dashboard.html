@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head">
+    <div><h1>Preventive maintenance overview</h1><p id="stamp" class="muted"></p></div>
+    <div class="actions">
+      <button id="refresh">Refresh</button>
+      <button id="restore">Restore initial data</button>
+      <button id="createAll" class="primary">Create work orders for at-risk machines</button>
+    </div>
+  </div>
+  <div id="err" class="err"></div>
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-head"><h2>Possible issues</h2><span class="muted">Machines with readings past a threshold</span></div>
+      <div id="issues"></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Open work orders</h2><span class="muted" id="woCount"></span></div>
+      <div id="openWo"></div>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <div class="card-head"><h2>Recent incidents</h2><span class="muted">Latest failures from the maintenance history</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Machine</th><th>Fault</th><th>Downtime</th><th>Cost</th><th>Resolution</th></tr></thead>
+        <tbody id="incidents"></tbody>
+      </table></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Parts to order</h2><span class="muted">Recommendations only; no purchase orders are placed</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Part</th><th>Stock / reorder level</th><th>Needed</th><th>Order qty</th><th>Total cost</th><th>Supplier</th><th>Lead time</th><th>Note</th></tr></thead>
+        <tbody id="partRows"></tbody>
+      </table></div>
+    </section>
+  </div>
+  <pre class="out hidden" id="out"></pre>
+</main>
+
+<script src="common.js"></script>
+<script src="trace.js"></script>
+<script>
+let data = null;
+
+function trendText(t) {
+  if (!t || t.projectedMinutesToCritical == null) return "";
+  return `At the last reading rate ${esc(t.metric)} reaches critical in about ${t.projectedMinutesToCritical} min.`;
+}
+
+function render(o) {
+  data = o;
+  $("stamp").textContent = `Updated ${fmtDate(o.generatedAt)} UTC`;
+  const alerts = o.machines.reduce((n, m) => n + m.breaches.length, 0);
+  $("kpis").innerHTML = [
+    ["red", o.totals.openWorkOrders, "Open work orders"],
+    ["amber", `${o.totals.atRisk} / ${o.machines.length}`, "Machines at risk"],
+    ["amber", alerts, "Readings past a threshold"],
+    ["", o.procurement.length, "Parts to order"],
+    ["green", money(o.totals.orderCost), "Recommended order cost"],
+  ].map(([c, v, k]) => `<div class="kpi ${c}"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
+
+  const risky = o.machines.filter((m) => m.riskLevel !== "low" || m.breaches.length || m.readings.some((r) => r.status === "approaching"));
+  $("issues").innerHTML = risky.map((m) => `
+    <div class="issue">
+      <div class="issue-top">
+        <div><b>${esc(m.name)}</b> <span class="muted">${esc(m.machineId)} · ${esc(m.location || "")}</span></div>
+        <div>${badge(m.riskLevel === "high" ? "elevated" : m.riskLevel, `Risk ${m.riskScore}`)}</div>
+      </div>
+      <div class="meter"><i class="${m.riskLevel === "critical" ? "crit" : m.riskLevel === "low" ? "low" : ""}" style="width:${m.riskScore}%"></i></div>
+      ${readingsTableHtml(m.readings.filter((r) => r.level !== null))}
+      ${m.possibleIssue ? `<div><b>Likely issue:</b> ${esc(m.possibleIssue.issue)}<div class="muted">${esc(m.possibleIssue.impact || "")} · repair about ${esc(m.possibleIssue.estimatedRepairTime || "unknown")}</div></div>` : ""}
+      <div class="muted">${trendText(m.trend)} Past incidents: ${esc(m.history.incidents)}, average repair ${money(m.history.avgCost)}.</div>
+      <div class="actions">
+        ${m.openWorkOrders.length ? `<span class="muted">Open work order ${esc(m.openWorkOrders.map((w) => w.number || w.id).join(", "))}</span>`
+          : `<button class="small primary" data-preview="${esc(m.machineId)}">Preview work order</button>`}
+      </div>
+    </div>`).join("") || `<p class="muted">No machines are past a threshold.</p>`;
+
+  $("woCount").textContent = `${o.openWorkOrders.length} open`;
+  $("openWo").innerHTML = o.openWorkOrders.map((w) => {
+    const crew = w.crew?.length ? w.crew : (w.assignedTo ? [{ name: w.assignedTo, role: "lead" }] : []);
+    return `<div class="wo" data-wo="${esc(w.id)}">
+      <div><b>${esc(w.title)}</b><div class="muted">${esc(w.workOrderNumber)} · ${esc(w.machineName)}</div></div>
+      <div>${badge(w.priority)} ${badge(w.status)}</div>
+      <div class="muted">${w.scheduledDate ? esc(fmtDate(w.scheduledDate)) + " UTC" : "Not scheduled"}${w.requiredParts?.length ? ` · ${w.requiredParts.length} part(s)` : ""}</div>
+      <div class="avatars">${crew.map((c) => `<div class="avatar ${c.role}" title="${esc(c.name)}">${esc(initials(c.name))}</div>`).join("")}</div>
+    </div>`;
+  }).join("") || `<p class="muted">No open work orders.</p>`;
+
+  $("incidents").innerHTML = o.incidents.map((h) => `
+    <tr><td>${esc(fmtDate(h.occurrenceDate).slice(0, 10))}</td><td>${esc(h.machineName)}</td><td><b>${esc(h.faultType)}</b></td>
+    <td>${esc(fmtMinutes(h.downtime))}</td><td>${money(h.cost)}</td><td class="muted">${esc(h.description)}</td></tr>`).join("");
+
+  $("partRows").innerHTML = o.procurement.map((p) => `
+    <tr>
+      <td>${esc(p.partName)}<br><span class="muted">${esc(p.partNumber)}</span></td>
+      <td>${esc(p.quantityInStock)} / ${esc(p.reorderLevel)}</td><td>${esc(p.requiredQuantity)}</td>
+      <td><b>${esc(p.orderQuantity)}</b>${p.minimumOrderBumped ? '<br><span class="muted">raised to meet minimum order</span>' : ""}</td>
+      <td>${money(p.totalCost)}<br><span class="muted">${money(p.unitCost)} each</span></td>
+      <td>${esc(p.supplierName)}<br><span class="muted">${esc(p.reliability || "")} ${p.rating ? "· " + esc(p.rating) : ""} ${esc(p.paymentTerms || "")}</span></td>
+      <td>${esc(p.leadTimeDays)} d${p.daysUntilNeeded != null ? `<br><span class="muted">needed in ${esc(p.daysUntilNeeded)} d</span>` : ""}</td>
+      <td>${p.atRisk ? badge("critical", "Late") + " " : ""}${esc(p.note || p.reason)}</td>
+    </tr>`).join("") || `<tr><td colspan="8" class="muted">Every part is above its reorder level, so no orders are recommended.</td></tr>`;
+}
+
+async function load() {
+  try { $("err").textContent = ""; render(await api("/api/overview")); }
+  catch (e) { $("err").textContent = e.message; }
+}
+
+document.addEventListener("click", (e) => {
+  const prev = e.target.closest("[data-preview]");
+  if (prev) return previewCheck(prev.dataset.preview, load).catch((err) => ($("err").textContent = err.message));
+  const row = e.target.closest("[data-wo]");
+  if (row) showBrief(data.openWorkOrders.find((w) => w.id === row.dataset.wo));
+});
+
+$("refresh").onclick = load;
+$("restore").onclick = async () => {
+  if (!confirm("Restore the initial data?\n\nThis deletes ALL current work orders, brings back the original sample work orders, and removes simulated readings.")) return;
+  try {
+    const r = await api("/api/restore-initial", { method: "POST", body: { confirm: "RESTORE" } });
+    $("out").textContent = `Restored. Removed ${r.workOrdersRemoved} work order(s), restored ${r.workOrdersRestored}, removed ${r.simulatedReadingsRemoved} simulated reading(s).`;
+    $("out").classList.remove("hidden");
+    await load();
+  } catch (e) { $("err").textContent = e.message; }
+};
+$("createAll").onclick = async () => {
+  const btn = $("createAll");
+  btn.disabled = true;
+  const results = [];
+  for (const m of data.machines.filter((x) => x.riskLevel !== "low" && !x.openWorkOrders.length)) {
+    try {
+      const r = await api(`/api/orchestrate/${encodeURIComponent(m.machineId)}`, { method: "POST", body: { dryRun: false } });
+      results.push(`${m.name}: ${r.action}${r.workOrder ? ` (${r.workOrder.workOrderNumber}, crew ${r.workOrder.crewSize})` : ""}`);
+    } catch (err) { results.push(`${m.name}: ${err.message}`); }
+  }
+  $("out").textContent = results.join("\n") || "No at-risk machines without an open work order.";
+  $("out").classList.remove("hidden");
+  btn.disabled = false;
+  load();
+};
+
+renderNav("dashboard.html");
+load();
+</script>
+</body>
+</html>

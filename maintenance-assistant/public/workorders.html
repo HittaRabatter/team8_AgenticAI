@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work Orders - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head">
+    <div><h1>Work orders</h1><p id="count" class="muted"></p></div>
+    <div class="actions"><button id="cleanup">Delete generated work orders</button><button id="toggleNew" class="primary">New work order</button></div>
+  </div>
+  <div id="err" class="err"></div>
+  <div id="info" class="callout hidden" style="margin-bottom:14px"></div>
+
+  <section class="card hidden" id="newPanel" style="margin-bottom:18px">
+    <div class="card-head"><h2>Create a work order</h2></div>
+    <form class="new" id="newForm">
+      <select id="nMachine" required></select>
+      <input id="nTitle" placeholder="Title" required>
+      <select id="nType"><option>corrective</option><option>preventive</option><option>predictive</option></select>
+      <select id="nPriority"><option>low</option><option selected>medium</option><option>high</option><option>critical</option></select>
+      <select id="nTech"></select>
+      <input id="nDate" type="datetime-local">
+      <textarea id="nDesc" rows="2" placeholder="Description"></textarea>
+      <div><button class="primary" type="submit">Create</button></div>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <div class="chips" id="chips"></div>
+      <input id="q" placeholder="Search title, machine or number" style="min-width:260px">
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Number</th><th>Machine</th><th>Title</th><th>Priority</th><th>Status</th><th>Crew</th><th>Scheduled (UTC)</th><th>Change status</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script src="common.js"></script>
+<script src="trace.js"></script>
+<script>
+const STATUSES = ["open", "in_progress", "completed", "cancelled"];
+let orders = [], machines = {}, techs = {}, filter = "";
+
+function render() {
+  const q = $("q").value.toLowerCase();
+  const rows = orders.filter((o) => (!filter || o.status === filter) &&
+    (!q || [o.workOrderNumber, o.title, o.machineId, machines[o.machineId]?.name].join(" ").toLowerCase().includes(q)));
+  $("count").textContent = `${rows.length} of ${orders.length} work orders`;
+  $("chips").innerHTML = ["", ...STATUSES].map((s) =>
+    `<span class="chip ${s === filter ? "on" : ""}" data-chip="${s}">${s ? s.replace("_", " ") : "All"} (${orders.filter((o) => !s || o.status === s).length})</span>`).join("");
+  $("rows").innerHTML = rows.map((o) => {
+    const crew = o.crew?.length ? o.crew.map((c) => c.name).join(", ") : (techs[o.assignedTo]?.name || o.assignedTo || "");
+    return `<tr class="click" data-id="${esc(o.id)}">
+      <td>${esc(o.workOrderNumber)}</td><td>${esc(machines[o.machineId]?.name || o.machineId)}</td>
+      <td><b>${esc(o.title)}</b></td><td>${badge(o.priority)}</td><td>${badge(o.status)}</td>
+      <td>${esc(crew)}</td><td>${esc(fmtDate(o.scheduledDate))}</td>
+      <td><select data-status="${esc(o.id)}">${STATUSES.map((s) => `<option value="${s}" ${s === o.status ? "selected" : ""}>${s.replace("_", " ")}</option>`).join("")}</select></td>
+      <td><button class="small" data-del="${esc(o.id)}">Delete</button></td>
+    </tr>`;
+  }).join("");
+}
+
+async function load() {
+  try { $("err").textContent = ""; orders = await api("/api/workorders"); render(); }
+  catch (e) { $("err").textContent = e.message; }
+}
+
+$("rows").onclick = async (e) => {
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    if (!confirm("Delete this work order? This cannot be undone.")) return;
+    try { await api(`/api/workorders/${encodeURIComponent(del.dataset.del)}`, { method: "DELETE" }); await load(); }
+    catch (err) { $("err").textContent = err.message; }
+    return;
+  }
+  if (e.target.closest("select")) return;
+  const tr = e.target.closest("tr[data-id]");
+  if (tr) { const o = orders.find((x) => x.id === tr.dataset.id); showBrief({ ...o, machineName: machines[o.machineId]?.name }); }
+};
+$("rows").onchange = async (e) => {
+  const id = e.target.dataset.status;
+  if (!id) return;
+  try {
+    const r = await api(`/api/workorders/${encodeURIComponent(id)}`, { method: "PATCH", body: { status: e.target.value } });
+    const info = $("info");
+    info.classList.toggle("hidden", !r.simulation);
+    if (r.simulation) info.textContent = `Completed. The readings of ${r.simulation.machineName} were set back to normal (simulation).`;
+    await load();
+  }
+  catch (err) { $("err").textContent = err.message; load(); }
+};
+$("cleanup").onclick = async () => {
+  if (!confirm("Delete every work order created by this app? The original sample work orders are kept.")) return;
+  try {
+    const r = await api("/api/workorders?scope=generated", { method: "DELETE" });
+    $("info").textContent = `Deleted ${r.deleted} work order(s).`;
+    $("info").classList.remove("hidden");
+    await load();
+  } catch (err) { $("err").textContent = err.message; }
+};
+$("chips").onclick = (e) => { if (e.target.dataset.chip !== undefined) { filter = e.target.dataset.chip; render(); } };
+$("q").oninput = render;
+$("toggleNew").onclick = () => $("newPanel").classList.toggle("hidden");
+
+$("newForm").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    await api("/api/workorders", { method: "POST", body: {
+      machineId: $("nMachine").value, title: $("nTitle").value, description: $("nDesc").value, type: $("nType").value,
+      priority: $("nPriority").value, assignedTo: $("nTech").value || null,
+      scheduledDate: $("nDate").value ? new Date($("nDate").value).toISOString() : null,
+    } });
+    e.target.reset();
+    $("newPanel").classList.add("hidden");
+    await load();
+  } catch (err) { $("err").textContent = err.message; }
+};
+
+(async () => {
+  renderNav("workorders.html");
+  try {
+    const [ms, ts] = await Promise.all([api("/api/machines"), api("/api/technicians")]);
+    ms.forEach((m) => (machines[m.id] = m));
+    ts.forEach((t) => (techs[t.id] = t));
+    $("nMachine").innerHTML = ms.map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("");
+    $("nTech").innerHTML = `<option value="">Unassigned</option>` + ts.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("");
+  } catch (e) { $("err").textContent = e.message; }
+  load();
+})();
+</script>
+</body>
+</html>

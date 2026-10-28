@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Machines - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head"><div><h1>Machines</h1><p id="count" class="muted"></p></div></div>
+  <div id="err" class="err"></div>
+  <div class="cards" id="grid" style="grid-template-columns:repeat(auto-fill,minmax(440px,1fr))"></div>
+
+  <section class="card hidden" id="detail">
+    <div class="card-head">
+      <h2 id="dTitle"></h2>
+      <div class="actions">
+        <button data-sim="warning">Simulate warning</button>
+        <button data-sim="critical">Simulate critical fault</button>
+        <button data-sim="normal">Reset readings to normal</button>
+        <button id="preview" class="primary">Preview preventive work order</button>
+      </div>
+    </div>
+    <div style="margin-bottom:18px"><h3 style="margin-bottom:8px">Latest readings</h3><div id="readings"></div></div>
+    <div class="grid-2" style="margin-bottom:0">
+      <div><h3 style="margin-bottom:8px">Work orders</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Number</th><th>Title</th><th>Priority</th><th>Status</th><th>Created (UTC)</th></tr></thead>
+          <tbody id="woRows"></tbody>
+        </table></div>
+      </div>
+      <div><h3 style="margin-bottom:8px">Failure history</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Date</th><th>Fault</th><th>Downtime</th><th>Cost</th></tr></thead>
+          <tbody id="hRows"></tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="common.js"></script>
+<script src="trace.js"></script>
+<script>
+let current = null, overview = null;
+
+async function select(m, card) {
+  current = m;
+  document.querySelectorAll(".mcard").forEach((c) => c.classList.remove("sel"));
+  card.classList.add("sel");
+  try {
+    const d = await api(`/api/machines/${encodeURIComponent(m.machineId)}/details`);
+    $("dTitle").textContent = `${m.name} (${m.machineId})`;
+    $("readings").innerHTML = readingsTableHtml(m.readings);
+    $("woRows").innerHTML = d.workOrders.map((o) => `
+      <tr class="click" data-wo="${esc(o.id)}"><td>${esc(o.workOrderNumber)}</td><td>${esc(o.title)}</td>
+      <td>${badge(o.priority)}</td><td>${badge(o.status)}</td><td>${esc(fmtDate(o.createdDate))}</td></tr>`).join("")
+      || `<tr><td colspan="5" class="muted">No work orders</td></tr>`;
+    $("woRows").dataset.json = JSON.stringify(d.workOrders);
+    $("hRows").innerHTML = d.history.map((h) => `
+      <tr><td>${esc(fmtDate(h.occurrenceDate).slice(0, 10))}</td><td><b>${esc(h.faultType)}</b><div class="muted">${esc(h.description)}</div></td>
+      <td>${esc(fmtMinutes(h.downtime))}</td><td>${money(h.cost)}</td></tr>`).join("")
+      || `<tr><td colspan="4" class="muted">No fault history</td></tr>`;
+    $("detail").classList.remove("hidden");
+    $("detail").scrollIntoView({ behavior: "smooth" });
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+async function load() {
+  try {
+    overview = await api("/api/overview");
+    $("count").textContent = `${overview.machines.length} machines`;
+    $("grid").innerHTML = "";
+    overview.machines.forEach((m) => {
+      const card = document.createElement("div");
+      card.className = "mcard" + (current?.machineId === m.machineId ? " sel" : "");
+      card.innerHTML = `
+        <div class="issue-top"><div><b>${esc(m.name)}</b><div class="muted">${esc(m.location || "")}</div></div>${badge(m.riskLevel === "high" ? "elevated" : m.riskLevel, `Risk ${m.riskScore}`)}</div>
+        <div class="meter"><i class="${m.riskLevel === "critical" ? "crit" : m.riskLevel === "low" ? "low" : ""}" style="width:${m.riskScore}%"></i></div>
+        ${readingsTableHtml(m.readings.filter((r) => r.level !== null))}
+        <div class="muted">${esc(m.history.incidents)} past incidents · ${m.openWorkOrders.length} open work order(s)</div>`;
+      card.onclick = () => select(m, card);
+      $("grid").appendChild(card);
+    });
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+$("woRows").onclick = (e) => {
+  const tr = e.target.closest("tr[data-wo]");
+  if (tr) showBrief({ ...JSON.parse($("woRows").dataset.json).find((o) => o.id === tr.dataset.wo), machineName: current.name });
+};
+$("preview").onclick = () => previewCheck(current.machineId, async () => {
+  const card = document.querySelector(".mcard.sel");
+  await load();
+  select(current, [...document.querySelectorAll(".mcard")].find((c) => c.classList.contains("sel")) || card);
+}).catch((e) => ($("err").textContent = e.message));
+
+renderNav("machines.html");
+document.querySelectorAll("[data-sim]").forEach((btn) => (btn.onclick = async () => {
+  try {
+    await api(`/api/machines/${encodeURIComponent(current.machineId)}/simulate`, { method: "POST", body: { mode: btn.dataset.sim } });
+    const id = current.machineId;
+    await load();
+    const m = overview.machines.find((x) => x.machineId === id);
+    const card = [...document.querySelectorAll(".mcard")][overview.machines.indexOf(m)];
+    if (m && card) select(m, card);
+  } catch (e) { $("err").textContent = e.message; }
+}));
+load();
+</script>
+</body>
+</html>

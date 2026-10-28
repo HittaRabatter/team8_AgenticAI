@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Explorer - Maintenance Assistant</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar" id="topbar"></header>
+<main class="page">
+  <div class="page-head"><div><h1>Data explorer</h1><p class="muted">Browse any container in the FactoryOpsDB database.</p></div></div>
+  <div id="err" class="err"></div>
+  <div class="toolbar">
+    <select id="container"></select>
+    <input id="q" placeholder="Search (machine, fault, status...)" style="min-width:280px">
+    <button id="go" class="primary">Load</button>
+    <span id="count" class="muted"></span>
+  </div>
+  <div class="grid-2">
+    <div class="card table-wrap" style="max-height:72vh"><table id="t"></table></div>
+    <pre class="out" id="detail">Select a row.</pre>
+  </div>
+</main>
+
+<script src="common.js"></script>
+<script>
+const fmt = (v) => (v && typeof v === "object" ? JSON.stringify(v) : v ?? "");
+
+async function load() {
+  $("err").textContent = "";
+  try {
+    const items = await api(`/api/items?container=${encodeURIComponent($("container").value)}&q=${encodeURIComponent($("q").value)}`);
+    $("count").textContent = `${items.length} records`;
+    const cols = [...new Set(items.flatMap((i) => Object.keys(i)))].filter((c) => !c.startsWith("_"));
+    const t = $("t");
+    t.innerHTML = "";
+    const head = t.createTHead().insertRow();
+    cols.forEach((c) => head.appendChild(Object.assign(document.createElement("th"), { textContent: c })));
+    const body = t.createTBody();
+    items.forEach((it) => {
+      const row = body.insertRow();
+      row.className = "click";
+      cols.forEach((c) => {
+        const cell = row.insertCell();
+        cell.textContent = String(fmt(it[c])).slice(0, 80);
+      });
+      row.onclick = () => ($("detail").textContent = JSON.stringify(it, null, 2));
+    });
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+(async () => {
+  renderNav("index.html");
+  try {
+    const cs = await api("/api/containers");
+    $("container").innerHTML = cs.map((c) => `<option>${esc(c.id)}</option>`).join("");
+    $("go").onclick = load;
+    $("q").onkeydown = (e) => e.key === "Enter" && load();
+    $("container").onchange = load;
+    load();
+  } catch (e) { $("err").textContent = e.message; }
+})();
+</script>
+</body>
+</html>
